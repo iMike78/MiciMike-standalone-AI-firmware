@@ -1,6 +1,6 @@
 # MiciMike AI Firmware
 
-Alternative ESP-IDF firmware for the MiciMike Gen2 Nest Mini drop-in PCB
+Alternative ESP-IDF firmware for the MiciMike Home/Nest Mini drop-in PCBs
 (ESP32-S3 + XMOS XU316). It turns the board into a standalone, privacy-conscious
 AI voice device using the OpenAI Realtime API, an OpenAI-compatible service, or
 a self-hosted Realtime LLM endpoint.
