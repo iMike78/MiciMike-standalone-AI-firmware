@@ -1,0 +1,18 @@
+# ESP-IDF build outputs
+build/
+managed_components/
+
+# Local/editor state
+.vscode/
+.idea/
+*.log
+*.tmp
+*.bak
+
+# Python/cache noise
+__pycache__/
+*.pyc
+
+# Local flashing/monitoring artifacts
+monitor*.log
+flash*.log

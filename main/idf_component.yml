@@ -1,0 +1,6 @@
+dependencies:
+  espressif/led_strip: "~3.0"
+  espressif/esp_websocket_client: "*"
+  espressif/cjson: "*"
+  espressif/esp-tflite-micro: "~1.3"
+  espressif/esp_audio_codec: "^2.5.0"
