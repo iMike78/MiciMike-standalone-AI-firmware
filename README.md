@@ -219,3 +219,13 @@ This firmware is designed for the
 Visit [micimike.com](https://micimike.com) or the
 [Crowd Supply campaign](https://crowdsupply.com/micimike-rev-devices) for more
 information.
+
+## Experimental firmware notice
+
+This standalone AI firmware is experimental and optional.
+
+It is not intended to be shipped preinstalled on production boards. The production firmware remains the ESPHome-based firmware, based on the Home Assistant Voice PE work.
+
+This firmware was developed with AI assistance. It is published openly under the MIT license so that anyone can inspect, review, modify, improve, or decide not to use it.
+
+Users should review the code, dependencies, configuration, and network behavior before flashing it to their own device. Use it at your own discretion and only if you understand the experimental nature of the project.
