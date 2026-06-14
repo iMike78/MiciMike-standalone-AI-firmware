@@ -53,14 +53,6 @@ Microphones
 Power amplifier / speaker path
 ```
 
-Notes:
-
-- The XMOS stage handles audio cleanup such as echo cancellation, noise
-  reduction, and gain control. This is a two-microphone design, not a beamforming
-  array.
-- The AIC3204 is the DAC/codec audio path. The speaker itself is driven
-  through the board's amplifier/speaker path, not directly by the AIC3204.
-
 ## Features
 
 - Standalone OpenAI Realtime voice assistant, no Home Assistant required.
