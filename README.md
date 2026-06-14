@@ -214,7 +214,7 @@ redistributing source or firmware binaries.
 ## Hardware
 
 This firmware is designed for the
-[MiciMike Gen2 Nest Mini drop-in PCB](https://github.com/iMike78/nest-mini-drop-in-pcb).
+MiciMike [Home](https://github.com/iMike78/home-mini-v1-drop-in-pcb)/[Nest](https://github.com/iMike78/nest-mini-drop-in-pcb) Mini drop-in PCBs.
 
 Visit [micimike.com](https://micimike.com) or the
 [Crowd Supply campaign](https://crowdsupply.com/micimike-rev-devices) for more
