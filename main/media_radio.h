@@ -28,6 +28,13 @@ radio_state_t media_radio_get_state(void);
 const char *media_radio_get_error(void);
 
 /**
+ * Copy the currently-playing track title (as advertised by the stream's
+ * Shoutcast/ICY metadata) into `out`. Empty string if the stream does
+ * not embed metadata or none has been received yet. Always NUL-terminated.
+ */
+void media_radio_get_track_title(char *out, size_t out_size);
+
+/**
  * Pause playback for a wake-word/voice session.
  * If radio is currently PLAYING (or CONNECTING) the URL is remembered and
  * playback is stopped; a later media_radio_resume() will pick it back up.

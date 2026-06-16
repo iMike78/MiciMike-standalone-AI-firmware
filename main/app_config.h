@@ -39,6 +39,7 @@
 #define PIN_I2S_IN_DIN          GPIO_NUM_15
 #define I2S_IN_SAMPLE_RATE      16000
 #define I2S_IN_BITS             32
+#define API_INPUT_CHANNEL       0       // send XMOS channel 0 to Realtime API
 #define MWW_INPUT_CHANNEL       1       // ESPHome voice_kit uses channel 1 for microWakeWord
 
 // ---------------------------------------------------------------------------
@@ -88,8 +89,13 @@
 // ---------------------------------------------------------------------------
 #define DEFAULT_SESSION_IDLE_TIMEOUT_S 10    // close session after 10s without local speech
 #define SESSION_MAX_DURATION_MS     300000  // 5 min max session
-#define SESSION_LOCAL_SPEECH_AVG_THRESHOLD 250
-#define SESSION_BARGE_IN_AVG_THRESHOLD 900
+// Per-chunk mic level (avg-abs of 30 ms, XMOS NS stage) that counts as
+// real user activity. Ambient noise sits around 100–400; assistant echo
+// during playback is several thousand. 1500 cleanly separates "someone
+// is talking" from "room is quiet" — without it the session can never
+// idle out because background noise constantly resets the idle timer.
+#define SESSION_LOCAL_SPEECH_AVG_THRESHOLD 1500
+#define SESSION_BARGE_IN_AVG_THRESHOLD 3000
 
 // ---------------------------------------------------------------------------
 // NVS keys

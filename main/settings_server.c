@@ -276,6 +276,7 @@ static const char SETTINGS_HTML[] =
 
 // Voice card
 "<div class='card'><h2>&#127908; Voice</h2>"
+"<div id='last-response-row' class='info' style='display:none;margin-bottom:10px;padding:8px;background:#161b22;border-left:3px solid #58a6ff;border-radius:4px;white-space:pre-wrap;word-break:break-word;'></div>"
 "<label>Wake Word</label>"
 "<select id='wakeword'>"
 "<option value='okay_nabu'>Okay Nabu</option>"
@@ -326,6 +327,7 @@ static const char SETTINGS_HTML[] =
 
 // Media card
 "<div class='card'><h2>&#127911; Media</h2>"
+"<div id='track-title-row' class='info' style='display:none;margin-bottom:10px;padding:8px;background:#161b22;border-left:3px solid #d29922;border-radius:4px;word-break:break-word;'></div>"
 "<label>Internet Radio</label>"
 "<select id='radio-station'><option value='-1'>-- no stations --</option></select>"
 "<p class='info'>Supports direct MP3, AAC, M4A, TS and WAV HTTP streams.</p>"
@@ -401,6 +403,7 @@ static const char SETTINGS_HTML[] =
 "if($('wakeword-runtime')){$('wakeword-runtime').textContent=w('activeWake')+': '+(d.runtime_wakeword||d.wakeword||'okay_nabu')+(d.wakeword_reboot_required?' ('+w('rebootNeeded')+')':'');}"
 "var u=d.usage||{};if(!orgUsageActive){$('tok-text').className='usage '+(u.has_usage?'ok':'');$('tok-text').title=u.raw_json||'';"
 "$('tok-text').textContent=u.has_usage?('TOK '+u.total_tokens+' / '+u.input_tokens+' in / '+u.output_tokens+' out'):'TOK --';}"
+"var lr=$('last-response-row');if(lr){var txt=(d.last_response_text||'').trim();if(txt){lr.textContent=txt;lr.style.display='block';}else{lr.textContent='';lr.style.display='none';}}"
 "}"
 
 // Load current settings
@@ -472,6 +475,7 @@ static const char SETTINGS_HTML[] =
 "var n=d.state==='playing'?(w('playing')+': '+(d.station_name||d.url||'')):"
 "(d.state==='connecting'?(w('connecting')+'...'):(d.state==='error'?(w('error')+': '+(d.error||'')):w('stopped')));"
 "$('radio-now').textContent=n;"
+"var tt=$('track-title-row');if(tt){var t=(d.track_title||'').trim();if(t&&d.state==='playing'){var parts=t.split(' - ');var html='';if(parts.length>=2){html='<strong>'+parts[0].replace(/[<>&]/g,function(c){return c==='&'?'&amp;':c==='<'?'&lt;':'&gt;';})+'</strong><br>'+parts.slice(1).join(' - ').replace(/[<>&]/g,function(c){return c==='&'?'&amp;':c==='<'?'&lt;':'&gt;';});}else{html=t.replace(/[<>&]/g,function(c){return c==='&'?'&amp;':c==='<'?'&lt;':'&gt;';});}tt.innerHTML=html;tt.style.display='block';}else{tt.textContent='';tt.style.display='none';}}"
 "}).catch(()=>{});"
 "}"
 "setInterval(refreshRadioNow,2500);refreshRadioNow();"
@@ -622,6 +626,11 @@ static esp_err_t api_get_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(usage_obj, "total_tokens", usage.total_tokens);
     cJSON_AddStringToObject(usage_obj, "raw_json", usage.raw_json);
     cJSON_AddItemToObject(root, "usage", usage_obj);
+
+    char last_response[2048];
+    ws_client_get_last_response_text(last_response, sizeof(last_response));
+    cJSON_AddStringToObject(root, "last_response_text", last_response);
+
     cJSON_AddBoolToObject(root, "dac_ready", aic3204_is_ready());
     cJSON_AddBoolToObject(root, "pa_on", gpio_get_level(PIN_SPEAKER_AMP) == 1);
     bool muted = gpio_get_level(PIN_MUTE_SWITCH) == 1;
@@ -1091,6 +1100,10 @@ static esp_err_t api_radio_status_handler(httpd_req_t *req)
         cJSON_AddStringToObject(root, "url", live_cfg->radio_url);
     }
     cJSON_AddNumberToObject(root, "current_index", idx);
+
+    char track_title[192];
+    media_radio_get_track_title(track_title, sizeof(track_title));
+    cJSON_AddStringToObject(root, "track_title", track_title);
 
     const char *json = cJSON_PrintUnformatted(root);
     httpd_resp_set_type(req, "application/json");

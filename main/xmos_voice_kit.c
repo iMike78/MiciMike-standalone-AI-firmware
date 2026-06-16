@@ -213,8 +213,17 @@ esp_err_t xmos_voice_kit_setup(xmos_pipeline_stage_t channel_0_stage,
     ret0 = xmos_read_pipeline_stage(CONFIGURATION_SERVICER_RESID_CHANNEL_0_PIPELINE_STAGE, &read_ch0);
     ret1 = xmos_read_pipeline_stage(CONFIGURATION_SERVICER_RESID_CHANNEL_1_PIPELINE_STAGE, &read_ch1);
 
-    ESP_LOGI(TAG, "XMOS pipeline stages: ch0=%u ch1=%u", read_ch0, read_ch1);
-    return (ret0 == ESP_OK && ret1 == ESP_OK) ? ESP_OK : ESP_FAIL;
+    ESP_LOGI(TAG, "XMOS pipeline stages: ch0=%u (want %u) ch1=%u (want %u)",
+             read_ch0, channel_0_stage, read_ch1, channel_1_stage);
+
+    if (ret0 != ESP_OK || ret1 != ESP_OK) {
+        return ESP_FAIL;
+    }
+    if (read_ch0 != channel_0_stage || read_ch1 != channel_1_stage) {
+        ESP_LOGE(TAG, "XMOS pipeline read-back mismatch — XMOS firmware did not accept config");
+        return ESP_FAIL;
+    }
+    return ESP_OK;
 }
 
 esp_err_t xmos_voice_kit_read_vnr(uint8_t *vnr)

@@ -59,3 +59,11 @@ esp_err_t ws_client_disconnect(void);
 esp_err_t ws_client_send_audio(const int16_t *pcm, size_t samples);
 ws_state_t ws_client_get_state(void);
 void ws_client_get_last_usage(ws_usage_info_t *out);
+
+/**
+ * Copy the assistant's most recent response transcript into `out`.
+ * Updated live as the Realtime API streams transcript deltas alongside
+ * the audio; reset to empty when a new response starts. Always
+ * NUL-terminated. Pass at least 2048 bytes to capture a full turn.
+ */
+void ws_client_get_last_response_text(char *out, size_t out_size);

@@ -35,6 +35,7 @@
 #include "hey_jarvis_model.h"
 #include "hey_mycroft_model.h"
 #include "alexa_model.h"
+#include "stop_model.h"
 #include "media_radio.h"
 
 #include "esp_log.h"
@@ -48,7 +49,6 @@
 #include "freertos/idf_additions.h"
 #include "esp_heap_caps.h"
 
-#include <math.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -77,19 +77,31 @@ static volatile bool api_vad_seen = false;
 static volatile uint32_t session_generation = 0;
 static volatile bool speaker_amp_on = false;
 static volatile bool end_session_after_response = false;
+static volatile bool session_end_cleanup_pending = false;
 static volatile int64_t mww_restart_not_before_ms = 0;
 static char active_wakeword[32] = DEFAULT_WAKEWORD;
 
-// Audio playback queue (response audio from API â†’ speaker)
-#define PLAYBACK_QUEUE_SIZE  160
+// Audio playback queue (response audio from API → speaker).
+// OpenAI's Realtime API ships output audio in bursts while the model
+// is still encoding, so the queue must be deep enough that brief
+// inter-burst pauses don't drain it below the 80 ms DMA buffer. 128
+// chunks × 30 ms ≈ 3.8 s of headroom. on_ws_audio BLOCKS on xQueueSend
+// when full — that propagates back to the WS socket as TCP recv
+// backpressure and throttles the server to roughly realtime.
+#define PLAYBACK_QUEUE_SIZE  128
 #define PLAYBACK_CHUNK_SIZE  1440   // 30ms of 24kHz PCM16 mono = 720 samples
 typedef struct {
     int16_t pcm[PLAYBACK_CHUNK_SIZE / sizeof(int16_t)];
     size_t samples;
 } audio_chunk_t;
 
-#define MIC_PREBUFFER_MS         2000
-#define MIC_PREBUFFER_FLUSH_MS   1200
+// Ring of recent mic chunks captured while the WS handshake is in flight.
+// On WS_STATE_CONNECTED we flush MIC_PREBUFFER_FLUSH_MS worth into the
+// stream so the wake word itself reaches the server. 240 ms covers
+// "Okay Nabu" / "Hey Jarvis" without prepending a long silent lead that
+// the Realtime API's server-side VAD would count as no_speech.
+#define MIC_PREBUFFER_MS         600
+#define MIC_PREBUFFER_FLUSH_MS   240
 #define MIC_PREBUFFER_CHUNKS     (MIC_PREBUFFER_MS / AUDIO_BUF_SIZE_MS)
 #define MIC_PREBUFFER_FLUSH_CHUNKS (MIC_PREBUFFER_FLUSH_MS / AUDIO_BUF_SIZE_MS)
 #define MIC_PREBUFFER_MAX_SAMPLES (MIC_BUF_SAMPLES * 2)
@@ -107,8 +119,10 @@ static uint32_t session_idle_timeout_ms(void)
 
 static void speaker_amp_enable(bool enable);
 static void wake_session_task(void *arg);
+static void session_end_cleanup_task(void *arg);
 static void session_error_cleanup_task(void *arg);
 static void on_settings_changed(uint32_t changed_mask);
+static void on_stop_word_detected(const char *wake_word);
 
 static const uint8_t *wakeword_model_data(const char *wakeword, size_t *size)
 {
@@ -133,11 +147,17 @@ static float wakeword_probability_cutoff(const char *wakeword, const char *sensi
     bool slight = strcmp(sensitivity, "slight") == 0;
     bool very = strcmp(sensitivity, "very") == 0;
 
+    // ESPHome publishes 0.83 for hey_jarvis "very", but with the
+    // MiciMike's PCB mic distance the NS-stage signal stays quiet
+    // enough that the 5-frame averaged probability rarely crosses
+    // that line — the user literally never wakes. We trade some
+    // false-positives for actually-triggers-when-spoken at "very";
+    // "moderate" and "slight" stay closer to the published values.
     if (strcmp(wakeword, "hey_jarvis") == 0) {
-        return slight ? 0.97f : (very ? 0.83f : 0.92f);
+        return slight ? 0.92f : (very ? 0.60f : 0.78f);
     }
     if (strcmp(wakeword, "hey_mycroft") == 0) {
-        return slight ? 0.99f : (very ? 0.93f : 0.95f);
+        return slight ? 0.97f : (very ? 0.72f : 0.86f);
     }
     return slight ? 0.85f : (very ? 0.56f : 0.69f);
 }
@@ -175,56 +195,6 @@ static void on_settings_changed(uint32_t changed_mask)
     }
 }
 
-static void write_wake_tone(int freq_hz, int duration_ms, int32_t amplitude)
-{
-    const int sample_rate = I2S_OUT_SAMPLE_RATE;
-    const int total_samples = sample_rate * duration_ms / 1000;
-    const int frames_per_chunk = sample_rate * 10 / 1000;
-    const float two_pi_f_over_sr = 2.0f * (float)M_PI * (float)freq_hz / (float)sample_rate;
-    int32_t *buf = heap_caps_malloc(frames_per_chunk * 2 * sizeof(int32_t),
-                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!buf) {
-        return;
-    }
-
-    int idx = 0;
-    while (idx < total_samples) {
-        int n = total_samples - idx;
-        if (n > frames_per_chunk) n = frames_per_chunk;
-
-        for (int i = 0; i < n; i++) {
-            int pos = idx + i;
-            int fade = sample_rate * 8 / 1000;
-            float env = 1.0f;
-            if (fade > 0 && pos < fade) {
-                env = (float)pos / (float)fade;
-            } else if (fade > 0 && total_samples - pos < fade) {
-                env = (float)(total_samples - pos) / (float)fade;
-            }
-            int32_t sample = (int32_t)(sinf(two_pi_f_over_sr * (float)pos) *
-                                       (float)amplitude * env);
-            buf[i * 2] = sample;
-            buf[i * 2 + 1] = sample;
-        }
-        idx += n;
-
-        size_t written = 0;
-        if (mm_i2s_write(buf, n * 2 * sizeof(int32_t), &written, 100) != ESP_OK) {
-            break;
-        }
-    }
-
-    free(buf);
-}
-
-static void play_wake_chime(void)
-{
-    write_wake_tone(660, 55, 7000000);
-    vTaskDelay(pdMS_TO_TICKS(20));
-    write_wake_tone(990, 75, 6500000);
-    vTaskDelay(pdMS_TO_TICKS(25));
-}
-
 static void start_session(const char *reason)
 {
     int64_t now = esp_timer_get_time() / 1000;
@@ -250,12 +220,14 @@ static void start_session(const char *reason)
     media_radio_pause_for_session();
 
     // Pre-warm the PA so the first audio chunk isn't clipped/lost when the
-    // RESPONDING event finally fires. Also exposes a "device heard you" cue
-    // via the beep below — useful both as UX and as an end-to-end audio test.
+    // RESPONDING event finally fires. Don't play a chime here: the chime
+    // is a tone burst on the AEC reference path and forces the XU316
+    // adaptive filter to re-converge, which costs ~200 ms at the start of
+    // every utterance and frequently eats the first syllable. The wake LED
+    // is the user cue.
     speaker_amp_enable(true);
     audio_chunk_t dummy;
     while (xQueueReceive(playback_queue, &dummy, 0) == pdTRUE);
-    play_wake_chime();
 
     ws_client_connect();
 }
@@ -267,8 +239,11 @@ static void mic_audio_levels(const int32_t *mic_buf, size_t frames,
     int32_t peak = 0;
 
     for (size_t i = 0; i < frames; i++) {
-        int32_t sample = mic_buf[i * 2 + MWW_INPUT_CHANNEL] >> 16;
-        int32_t abs_sample = sample < 0 ? -sample : sample;
+        int32_t left = mic_buf[i * 2] >> 16;
+        int32_t right = mic_buf[i * 2 + 1] >> 16;
+        int32_t abs_left = left < 0 ? -left : left;
+        int32_t abs_right = right < 0 ? -right : right;
+        int32_t abs_sample = abs_left > abs_right ? abs_left : abs_right;
         sum_abs += abs_sample;
         if (abs_sample > peak) {
             peak = abs_sample;
@@ -282,60 +257,6 @@ static void mic_audio_levels(const int32_t *mic_buf, size_t frames,
         *peak_abs = peak;
     }
 }
-
-// ---------------------------------------------------------------------------
-// XMOS reset
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// XMOS pipeline stage configuration via I2C
-// Mirrors ESPHome voice_kit component write_pipeline_stages().
-// Must be called after XMOS boot (>3s after reset).
-// XMOS I2C slave address: 0x2C (sln_voice default)
-// ---------------------------------------------------------------------------
-#if 0
-#define XMOS_I2C_ADDR                   0x2C
-#define XMOS_CONFIGURATION_SERVICER_RESID        241
-#define XMOS_CHANNEL_0_PIPELINE_STAGE_REG        0x30
-#define XMOS_CHANNEL_1_PIPELINE_STAGE_REG        0x40
-#define XMOS_PIPELINE_STAGE_AGC                  4
-
-static void xmos_configure_pipeline(void)
-{
-    // Channel 0: AGC (fully processed: AEC+IC+NS+AGC) â€” used by MWW and VA
-    uint8_t ch0_cmd[] = {
-        XMOS_CONFIGURATION_SERVICER_RESID,
-        XMOS_CHANNEL_0_PIPELINE_STAGE_REG,
-        1,
-        XMOS_PIPELINE_STAGE_AGC
-    };
-    esp_err_t ret = i2c_master_write_to_device(0, XMOS_I2C_ADDR,  // I2C_NUM_0 = 0
-                                               ch0_cmd, sizeof(ch0_cmd),
-                                               pdMS_TO_TICKS(100));
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "XMOS ch0 pipeline config failed (addr=0x%02x): %s",
-                 XMOS_I2C_ADDR, esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "XMOS ch0 pipeline: AGC");
-    }
-
-    // Channel 1: AGC â€” same processing on both channels
-    uint8_t ch1_cmd[] = {
-        XMOS_CONFIGURATION_SERVICER_RESID,
-        XMOS_CHANNEL_1_PIPELINE_STAGE_REG,
-        1,
-        XMOS_PIPELINE_STAGE_AGC
-    };
-    ret = i2c_master_write_to_device(0, XMOS_I2C_ADDR,  // I2C_NUM_0 = 0
-                                     ch1_cmd, sizeof(ch1_cmd),
-                                     pdMS_TO_TICKS(100));
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "XMOS ch1 pipeline config failed: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "XMOS ch1 pipeline: AGC");
-    }
-}
-#endif
 
 // ---------------------------------------------------------------------------
 // Speaker amplifier control
@@ -373,9 +294,16 @@ static int mute_gpio_level(void)
 // ---------------------------------------------------------------------------
 static void on_ws_audio(const int16_t *pcm, size_t samples)
 {
-    // Queue response audio for playback task
-    // Split into chunks if needed
+    // Queue response audio for the playback task. Block briefly when the
+    // queue is full: the WS receive task pauses, the TCP recv window
+    // closes, and the OpenAI server throttles itself to roughly the
+    // 24 kHz playback rate. Without that backpressure the API bursts at
+    // multiple-× realtime and we'd have to drop most of the response.
+    // 250 ms is well below the WS ping interval, so we don't risk a
+    // keepalive timeout, and long enough that the playback task can
+    // drain ~8 chunks of queue.
     size_t offset = 0;
+    size_t dropped = 0;
     while (offset < samples) {
         audio_chunk_t chunk;
         chunk.samples = samples - offset;
@@ -385,9 +313,17 @@ static void on_ws_audio(const int16_t *pcm, size_t samples)
         memcpy(chunk.pcm, &pcm[offset], chunk.samples * sizeof(int16_t));
         offset += chunk.samples;
 
-        if (xQueueSend(playback_queue, &chunk, pdMS_TO_TICKS(10)) != pdTRUE) {
-            ESP_LOGW(TAG, "Playback queue full, dropping audio chunk");
+        // 200 ms wait stays comfortably under esp_websocket_client's
+        // 250 ms internal lock timeout (which printed
+        // "Could not lock ws-client within 250 timeout" in the previous
+        // run when we sat at the edge).
+        if (xQueueSend(playback_queue, &chunk, pdMS_TO_TICKS(200)) != pdTRUE) {
+            dropped++;
         }
+    }
+    if (dropped > 0) {
+        ESP_LOGW(TAG, "Playback queue still full after backpressure, dropped %u new chunk(s)",
+                 (unsigned)dropped);
     }
     last_activity_ms = esp_timer_get_time() / 1000;
 }
@@ -404,20 +340,44 @@ static void on_ws_state(ws_state_t state)
         last_activity_ms = esp_timer_get_time() / 1000;
         ESP_LOGI(TAG, "Session ready, listening...");
         if (end_session_after_response && app_state == APP_STATE_SESSION) {
-            ESP_LOGI(TAG, "Ending session after deferred device command response");
+            ESP_LOGI(TAG, "Scheduling session end after deferred device command response");
             end_session_after_response = false;
-            ws_client_disconnect();
-            speaker_amp_enable(false);
-            app_state = APP_STATE_IDLE;
-            led_control_set_state(LED_STATE_IDLE);
-            mww_restart_not_before_ms = (esp_timer_get_time() / 1000) + 2000;
-            media_radio_resume();
+            if (!session_end_cleanup_pending) {
+                session_end_cleanup_pending = true;
+                BaseType_t created = xTaskCreatePinnedToCore(session_end_cleanup_task,
+                                                             "sess_end_clean",
+                                                             4096,
+                                                             NULL,
+                                                             6,
+                                                             NULL,
+                                                             1);
+                if (created != pdPASS) {
+                    session_end_cleanup_pending = false;
+                    ESP_LOGE(TAG, "Failed to create session end cleanup task");
+                }
+            }
         }
         break;
     case WS_STATE_LISTENING:
         led_control_set_state(LED_STATE_SESSION_ACTIVE);
         api_vad_seen = true;
         last_activity_ms = esp_timer_get_time() / 1000;
+        // If we just entered LISTENING during an active response, the
+        // server detected user speech and cancelled the response — drop
+        // anything still queued so the cancelled tail doesn't play over
+        // the user's interruption. (When LISTENING fires at the start
+        // of a normal turn the queue is already empty, so it's a no-op.)
+        if (playback_queue) {
+            audio_chunk_t dropped;
+            size_t flushed = 0;
+            while (xQueueReceive(playback_queue, &dropped, 0) == pdTRUE) {
+                flushed++;
+            }
+            if (flushed > 0) {
+                ESP_LOGI(TAG, "Barge-in: flushed %u queued playback chunks",
+                         (unsigned)flushed);
+            }
+        }
         break;
     case WS_STATE_RESPONDING:
         led_control_set_state(LED_STATE_SPEAKING);
@@ -482,6 +442,12 @@ static esp_err_t on_device_control(const char *action, int value,
     }
 
     if (strcmp(action, "radio_play") == 0) {
+        if (value != 1) {
+            snprintf(result, result_size,
+                     "Radio play rejected: explicit radio_play confirmation value is required.");
+            return ESP_ERR_INVALID_ARG;
+        }
+
         int idx = config.radio_current_index;
         if ((idx < 0 || idx >= (int)config.radio_station_count) &&
             config.radio_station_count > 0) {
@@ -554,34 +520,35 @@ static esp_err_t on_device_control(const char *action, int value,
 // ---------------------------------------------------------------------------
 static void playback_task(void *arg)
 {
-    // Output buffer: 48kHz stereo 32bit — sized for one chunk after 2× upsample.
-    // chunk.samples ≤ 720 (24 kHz, 30 ms) → out_frames ≤ 1440 stereo frames →
-    // 1440 * 2 ch * 4 B = 11520 B. Allocate 16 KiB to be safe.
+    // Output buffer: 48 kHz stereo 32-bit, sized for one chunk after the
+    // 2× upsample. chunk.samples ≤ 720 (24 kHz, 30 ms) → 1440 stereo
+    // frames × 2 ch × 4 B = 11520 B. 16 KiB gives safe headroom.
     const size_t spk_buf_bytes = 16 * 1024;
     int32_t *spk_buf = heap_caps_malloc(spk_buf_bytes, MALLOC_CAP_SPIRAM);
     audio_chunk_t chunk;
-    const size_t silence_frames = I2S_OUT_SAMPLE_RATE * AUDIO_BUF_SIZE_MS / 1000;
 
     while (1) {
-        if (xQueueReceive(playback_queue, &chunk, pdMS_TO_TICKS(100)) == pdTRUE) {
-            // Resample 24kHz/16bit/mono → 48kHz/32bit/stereo
-            size_t out_frames = audio_resample_to_speaker(
-                chunk.pcm, chunk.samples,
-                spk_buf, spk_buf_bytes);
+        // Wait for the next chunk. While the queue is empty the I2S TX
+        // DMA outputs zeros automatically (auto_clear_after_cb), so we
+        // don't need to write a manual silence frame — doing so would
+        // just block this task for another 30 ms inside i2s_channel_write
+        // and slow our response to real audio when it does arrive.
+        if (xQueueReceive(playback_queue, &chunk, pdMS_TO_TICKS(100)) != pdTRUE) {
+            continue;
+        }
 
-            size_t bytes_to_write = out_frames * 2 * sizeof(int32_t);
-            size_t written = 0;
-            esp_err_t ret = mm_i2s_write(spk_buf, bytes_to_write, &written, 500);
-            if (ret != ESP_OK || written != bytes_to_write) {
-                ESP_LOGW(TAG, "Playback I2S write failed: wrote=%u/%u ret=%s",
-                         (unsigned)written, (unsigned)bytes_to_write,
-                         esp_err_to_name(ret));
-            }
-        } else if (app_state == APP_STATE_SESSION && speaker_amp_on) {
-            memset(spk_buf, 0, silence_frames * 2 * sizeof(int32_t));
-            size_t written = 0;
-            mm_i2s_write(spk_buf, silence_frames * 2 * sizeof(int32_t),
-                         &written, 100);
+        // Resample 24kHz/16bit/mono → 48kHz/32bit/stereo
+        size_t out_frames = audio_resample_to_speaker(
+            chunk.pcm, chunk.samples,
+            spk_buf, spk_buf_bytes);
+
+        size_t bytes_to_write = out_frames * 2 * sizeof(int32_t);
+        size_t written = 0;
+        esp_err_t ret = mm_i2s_write(spk_buf, bytes_to_write, &written, 100);
+        if (ret != ESP_OK || written != bytes_to_write) {
+            ESP_LOGW(TAG, "Playback I2S write failed: wrote=%u/%u ret=%s",
+                     (unsigned)written, (unsigned)bytes_to_write,
+                     esp_err_to_name(ret));
         }
     }
 }
@@ -623,7 +590,6 @@ static void mic_capture_task(void *arg)
     int32_t last_avg_abs = 0;
     int32_t last_peak_abs = 0;
     int64_t last_stats_ms = 0;
-    int64_t barge_in_until_ms = 0;
 
     while (1) {
         if (app_state != APP_STATE_SESSION) {
@@ -658,12 +624,10 @@ static void mic_capture_task(void *arg)
         size_t in_frames = bytes_read / (2 * sizeof(int32_t));  // stereo frames
         mic_audio_levels(mic_buf, in_frames, &last_avg_abs, &last_peak_abs);
         int64_t level_now_ms = esp_timer_get_time() / 1000;
+        ws_state_t ws_state = ws_client_get_state();
+
         if (last_avg_abs >= SESSION_LOCAL_SPEECH_AVG_THRESHOLD) {
             last_activity_ms = level_now_ms;
-        }
-        if (ws_client_get_state() == WS_STATE_RESPONDING &&
-            last_avg_abs >= SESSION_BARGE_IN_AVG_THRESHOLD) {
-            barge_in_until_ms = level_now_ms + 1200;
         }
 
         // Resample 16kHz/32bit/stereo â†’ 24kHz/16bit/mono
@@ -685,12 +649,18 @@ static void mic_capture_task(void *arg)
                 prebuf_count++;
             }
 
-            ws_state_t ws_state = ws_client_get_state();
+            // Keep streaming the mic to the API even while it's actively
+            // RESPONDING — that's what makes barge-in work. The audio we
+            // forward (channel 0, AGC stage) is the fully echo-cancelled
+            // XMOS output, so the assistant's own voice doesn't trigger
+            // the server's semantic VAD. interrupt_response=true in the
+            // session config makes the API cancel the current response
+            // as soon as the VAD fires; we react locally by flushing
+            // the playback queue in the LISTENING handler.
             bool can_send = ws_state == WS_STATE_CONNECTED ||
                             ws_state == WS_STATE_LISTENING ||
-                            ws_state == WS_STATE_TOOL_RUNNING ||
-                            (ws_state == WS_STATE_RESPONDING &&
-                             level_now_ms < barge_in_until_ms);
+                            ws_state == WS_STATE_RESPONDING ||
+                            ws_state == WS_STATE_TOOL_RUNNING;
 
             if (can_send && !prebuffer_flushed) {
                 size_t flushed_chunks = 0;
@@ -823,9 +793,6 @@ static void on_touch_event(touch_event_t event)
 }
 
 // ---------------------------------------------------------------------------
-// Wake word detection placeholder
-// ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
 // Wake word detection callback
 // ---------------------------------------------------------------------------
 static void on_wake_word_detected(const char *wake_word)
@@ -865,6 +832,28 @@ static void on_wake_word_detected(const char *wake_word)
     }
 }
 
+static void on_stop_word_detected(const char *wake_word)
+{
+    ESP_LOGI(TAG, "Stop word '%s' detected: stopping local audio/session", wake_word);
+
+    ws_client_disconnect();
+    media_radio_stop();
+    media_radio_clear_pending();
+    speaker_amp_enable(false);
+    end_session_after_response = false;
+    wake_session_pending = false;
+
+    if (playback_queue) {
+        audio_chunk_t dummy;
+        while (xQueueReceive(playback_queue, &dummy, 0) == pdTRUE);
+    }
+
+    app_state = APP_STATE_IDLE;
+    last_activity_ms = esp_timer_get_time() / 1000;
+    mww_restart_not_before_ms = last_activity_ms + 1000;
+    led_control_set_state(LED_STATE_IDLE);
+}
+
 static void wake_session_task(void *arg)
 {
     const char *wake_word = (const char *)arg;
@@ -876,6 +865,30 @@ static void wake_session_task(void *arg)
 
     start_session(wake_word ? wake_word : "wake_word");
     wake_session_pending = false;
+    vTaskDelete(NULL);
+}
+
+static void session_end_cleanup_task(void *arg)
+{
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    ws_client_disconnect();
+    speaker_amp_enable(false);
+
+    if (playback_queue) {
+        audio_chunk_t dummy;
+        while (xQueueReceive(playback_queue, &dummy, 0) == pdTRUE);
+    }
+
+    app_state = APP_STATE_IDLE;
+    led_control_set_state(LED_STATE_IDLE);
+    mww_restart_not_before_ms = (esp_timer_get_time() / 1000) + 2000;
+
+    // Restore deferred radio playback only after the websocket task is out of
+    // its own event callback. Calling ws_client_disconnect() inside that
+    // callback can assert inside esp_websocket_client.
+    media_radio_resume();
+
+    session_end_cleanup_pending = false;
     vTaskDelete(NULL);
 }
 
@@ -897,11 +910,29 @@ static void session_error_cleanup_task(void *arg)
 }
 
 // ---------------------------------------------------------------------------
-// Session timeout monitor
+// Session timeout monitor + XMOS VNR heartbeat
 // ---------------------------------------------------------------------------
+// Reading the VNR register every few seconds is a cheap liveness check on
+// the XU316: if it stops returning a sane (1..254) value the pipeline has
+// stalled, even if the mic I2S looks fine on the ESP32 side.
+#define VNR_LOG_INTERVAL_MS 5000
+
 static void session_monitor_task(void *arg)
 {
+    int64_t last_vnr_log_ms = 0;
+
     while (1) {
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        if (now_ms - last_vnr_log_ms >= VNR_LOG_INTERVAL_MS) {
+            uint8_t vnr = 0;
+            if (xmos_voice_kit_read_vnr(&vnr) == ESP_OK) {
+                ESP_LOGI(TAG, "XMOS VNR=%u state=%d", vnr, app_state);
+            } else {
+                ESP_LOGW(TAG, "XMOS VNR read failed");
+            }
+            last_vnr_log_ms = now_ms;
+        }
+
         if (app_state == APP_STATE_SESSION && !wake_session_pending) {
             int64_t now = esp_timer_get_time() / 1000;
             int64_t session_ms = now - session_started_ms;
@@ -1016,9 +1047,15 @@ void app_main(void)
     // aic3204_init installs the shared I2C driver used by the XMOS control port.
     aic3204_init();
 
+    // Pipeline-stage assignment mirrors ESPHome voice_kit defaults:
+    //   ch0 = AGC  -> fully processed, sent to the Realtime API
+    //   ch1 = NS   -> noise-suppressed, used by microWakeWord
+    // The XU316 firmware (ffva v1.3.1) accepts these over I2C and routes
+    // the corresponding pipeline taps to the I2S2 output that the ESP32
+    // reads as the mic input.
     xmos_firmware_version_t xmos_version = {0};
     esp_err_t xmos_ret = xmos_voice_kit_setup(XMOS_PIPELINE_STAGE_AGC,
-                                              XMOS_PIPELINE_STAGE_AGC,
+                                              XMOS_PIPELINE_STAGE_NS,
                                               &xmos_version);
     if (xmos_ret != ESP_OK) {
         ESP_LOGE(TAG, "XMOS Voice Kit setup failed: %s", esp_err_to_name(xmos_ret));
@@ -1079,9 +1116,20 @@ void app_main(void)
         .model_data = wakeword_model,
         .model_size = wakeword_model_size,
         .probability_cutoff = wakeword_cutoff,
+        .stop_model_data = NULL,
+        .stop_model_size = 0,
+        .stop_probability_cutoff = 0.0f,
+        .on_stop_detected = NULL,
         .sliding_window_size = 5,
         .tensor_arena_size = 0,
-        .gain_factor = 1,
+        // ESPHome HA Voice PE uses gain_factor=4 with the NS-stage XMOS
+        // output, but the MiciMike PCB's MEMS path is measurably quieter
+        // than the HA Voice PE — the previous log showed NS peaks of
+        // ~75-130 in silence (i.e. raw NS peak ~20-30 before the 4×
+        // multiplier). Bumping to 8 lifts that to ~150-260 and brings
+        // real speech well above the model's int8 noise floor without
+        // ever approaching clipping in normal use.
+        .gain_factor = 8,
         .input_channel = MWW_INPUT_CHANNEL,
         .on_detected = on_wake_word_detected,
     };

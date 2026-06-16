@@ -8,6 +8,7 @@
 
 #pragma once
 #include "esp_err.h"
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -17,6 +18,9 @@ extern "C" {
 
 esp_err_t mm_i2s_init(void);
 esp_err_t mm_i2s_deinit(void);
+
+/** True after a successful mm_i2s_init() and before mm_i2s_deinit(). */
+bool mm_i2s_is_ready(void);
 
 /**
  * Read raw audio from XMOS I2S input.

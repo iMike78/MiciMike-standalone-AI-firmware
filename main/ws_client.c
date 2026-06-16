@@ -48,6 +48,16 @@ static uint8_t *decode_buf = NULL;
 static char *recv_msg_buf = NULL;
 static size_t recv_msg_buf_size = 0;
 static SemaphoreHandle_t ws_lock = NULL;
+
+// Accumulated transcript of the assistant's most recent response. Filled
+// from response.output_audio_transcript.delta events; cleared on
+// response.created so each new turn starts fresh. Exposed read-only via
+// ws_client_get_last_response_text() for the web UI. The Realtime API
+// emits text and audio tokens together, so this is exactly what the
+// model said — no separate STT pass.
+#define LAST_RESPONSE_TEXT_SIZE 2048
+static char last_response_text[LAST_RESPONSE_TEXT_SIZE];
+static size_t last_response_pos = 0;
 static portMUX_TYPE usage_lock = portMUX_INITIALIZER_UNLOCKED;
 static ws_usage_info_t last_usage = {0};
 static char last_function_call_id[64] = {0};
@@ -354,10 +364,11 @@ static void send_session_update(void)
              "Detect and follow the user's spoken language automatically. "
              "If the user asks for real-time translation between languages, do that. "
              "You may control this device only by calling the device_control tool. "
-             "Use it for radio playback and volume commands. "
+             "Use device_control only for explicit radio playback and volume commands, never for ordinary questions. "
              "For current facts, dates, holidays, news, prices, or anything that may have changed, call web_lookup before answering. "
              "Never start radio playback unless the user's latest request explicitly asks to start, play, resume, or turn on the radio. "
-             "Do not infer radio_play from background audio, prior context, or as a follow-up action. "
+             "For radio_play, set value to exactly 1 only when the latest user request explicitly asks to play/start/resume/turn on radio. "
+             "Do not infer radio_play from background audio, prior context, date/time questions, or as a follow-up action. "
              "After a successful tool call, briefly confirm the action in the user's language. "
              "%s\n\nCustom system prompt:\n%.1000s",
              style_instruction(style), custom);
@@ -402,7 +413,7 @@ static void send_session_update(void)
     cJSON_AddStringToObject(tool, "type", "function");
     cJSON_AddStringToObject(tool, "name", "device_control");
     cJSON_AddStringToObject(tool, "description",
-                            "Control the local MiciMike device: internet radio playback and speaker volume.");
+                            "Control the local MiciMike device only for explicit internet radio playback and speaker volume requests. Do not use for questions, dates, news, or general answers.");
 
     cJSON *parameters = cJSON_CreateObject();
     cJSON_AddStringToObject(parameters, "type", "object");
@@ -416,18 +427,19 @@ static void send_session_update(void)
     cJSON_AddItemToArray(action_enum, cJSON_CreateString("volume_delta"));
     cJSON_AddItemToObject(action, "enum", action_enum);
     cJSON_AddStringToObject(action, "description",
-                            "radio_play starts the selected station, radio_stop stops playback, volume_set sets absolute volume percent, volume_delta changes volume percent by a signed amount.");
+                            "radio_play starts the selected station only when the user's latest request explicitly asks for radio playback; radio_stop stops playback; volume_set sets absolute volume percent; volume_delta changes volume percent by a signed amount.");
     cJSON_AddItemToObject(properties, "action", action);
 
     cJSON *value = cJSON_CreateObject();
     cJSON_AddStringToObject(value, "type", "integer");
     cJSON_AddStringToObject(value, "description",
-                            "For volume_set use 0..100. For volume_delta use a signed percent change such as -10 or 10. Ignored for radio actions.");
+                            "For radio_play use exactly 1 as explicit confirmation. For radio_stop use 1. For volume_set use 0..100. For volume_delta use a signed percent change such as -10 or 10.");
     cJSON_AddItemToObject(properties, "value", value);
     cJSON_AddItemToObject(parameters, "properties", properties);
 
     cJSON *required = cJSON_CreateArray();
     cJSON_AddItemToArray(required, cJSON_CreateString("action"));
+    cJSON_AddItemToArray(required, cJSON_CreateString("value"));
     cJSON_AddItemToObject(parameters, "required", required);
     cJSON_AddBoolToObject(parameters, "additionalProperties", false);
     cJSON_AddItemToObject(tool, "parameters", parameters);
@@ -671,6 +683,37 @@ static void handle_ws_message(const char *data, int len)
 
     } else if (strcmp(evt, "response.created") == 0) {
         ESP_LOGI(TAG, "API response created");
+        // New turn starting — clear the previous transcript so the web UI
+        // shows only the in-flight reply, not a concatenation of older ones.
+        last_response_text[0] = '\0';
+        last_response_pos = 0;
+
+    } else if (strcmp(evt, "response.output_audio_transcript.delta") == 0 ||
+               strcmp(evt, "response.audio_transcript.delta") == 0) {
+        // Append the transcript fragment that arrived with this audio
+        // chunk. Each delta is a few words/characters. If the buffer
+        // would overflow we silently drop the tail — the web UI shows
+        // a truncated view, which is better than corrupting earlier text.
+        cJSON *delta = cJSON_GetObjectItem(root, "delta");
+        if (delta && cJSON_IsString(delta) && delta->valuestring) {
+            const char *s = delta->valuestring;
+            size_t len = strlen(s);
+            size_t room = LAST_RESPONSE_TEXT_SIZE - 1 - last_response_pos;
+            if (len > room) len = room;
+            if (len > 0) {
+                memcpy(last_response_text + last_response_pos, s, len);
+                last_response_pos += len;
+                last_response_text[last_response_pos] = '\0';
+            }
+            // First delta of a response logs the total so we can verify
+            // from the serial console that the accumulator is fed. Later
+            // deltas would just spam the log.
+            if (last_response_pos > 0 && last_response_pos == len) {
+                ESP_LOGI(TAG, "Transcript stream started: '%s'", last_response_text);
+            }
+        } else {
+            ESP_LOGW(TAG, "transcript.delta event without string 'delta' field");
+        }
 
     } else if (strcmp(evt, "response.output_item.done") == 0 ||
                strcmp(evt, "conversation.item.done") == 0) {
@@ -976,4 +1019,18 @@ void ws_client_get_last_usage(ws_usage_info_t *out)
     portENTER_CRITICAL(&usage_lock);
     *out = last_usage;
     portEXIT_CRITICAL(&usage_lock);
+}
+
+void ws_client_get_last_response_text(char *out, size_t out_size)
+{
+    if (!out || out_size == 0) return;
+    // The transcript is appended in the WS event-handler task and read
+    // here from the HTTP server task. A delta could land mid-copy and
+    // we'd see a slightly torn tail — for a 2 KiB ASCII/UTF-8 buffer
+    // updated at human speech rate that's harmless on the UI side, so
+    // we skip the mutex.
+    size_t len = strnlen(last_response_text, LAST_RESPONSE_TEXT_SIZE);
+    if (len >= out_size) len = out_size - 1;
+    memcpy(out, last_response_text, len);
+    out[len] = '\0';
 }

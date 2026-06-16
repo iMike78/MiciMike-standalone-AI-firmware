@@ -26,6 +26,10 @@ typedef struct {
     const uint8_t *model_data;         // pointer to embedded TFLite model
     size_t model_size;                 // model size in bytes
     float probability_cutoff;          // detection threshold (0.0-1.0), default 0.5
+    const uint8_t *stop_model_data;     // optional always-on local stop model
+    size_t stop_model_size;             // stop model size in bytes
+    float stop_probability_cutoff;      // stop detection threshold, default 0.5
+    mww_detection_cb_t on_stop_detected;// callback when stop model is detected
     size_t sliding_window_size;        // number of inferences to average, default 10
     size_t tensor_arena_size;          // tensor arena bytes, default 20000
     uint8_t gain_factor;               // audio gain before frontend, default 1
