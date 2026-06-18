@@ -606,7 +606,7 @@ static void handle_function_call_item(cJSON *item)
                 if (client_cfg.state_cb) client_cfg.state_cb(WS_STATE_TOOL_RUNNING);
                 web_lookup_in_flight = true;
                 BaseType_t ok = xTaskCreatePinnedToCore(web_lookup_task, "web_lookup",
-                                                        8192, task_arg, 6, NULL, 0);
+                                                        8192, task_arg, 0, NULL, 0);
                 if (ok == pdPASS) {
                     cJSON_Delete(args);
                     return;
@@ -1000,7 +1000,7 @@ esp_err_t ws_client_send_audio(const int16_t *pcm, size_t samples)
         return ESP_ERR_NO_MEM;
     }
 
-    int sent = esp_websocket_client_send_text(ws_handle, send_buf, json_len, pdMS_TO_TICKS(250));
+    int sent = esp_websocket_client_send_text(ws_handle, send_buf, json_len, pdMS_TO_TICKS(1000));
     if (ws_lock) {
         xSemaphoreGive(ws_lock);
     }

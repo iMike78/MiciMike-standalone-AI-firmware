@@ -24,6 +24,7 @@
 #define SETTINGS_CHANGED_STYLE      (1u << 4)
 #define SETTINGS_CHANGED_PROMPT     (1u << 5)
 #define SETTINGS_CHANGED_TIMEOUT    (1u << 6)
+#define SETTINGS_CHANGED_SNAPCAST   (1u << 7)
 
 typedef void (*settings_changed_cb_t)(uint32_t changed_mask);
 

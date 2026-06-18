@@ -9,6 +9,7 @@
 #include "app_config.h"
 #include "aic3204.h"
 #include "i2s_hal.h"
+#include "sendspin_iface.h"
 
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
@@ -1188,6 +1189,8 @@ esp_err_t media_radio_start(const char *url)
         return ESP_ERR_INVALID_STATE;
     }
 
+    sendspin_iface_external_media_started();
+
     if (radio_task_handle) {
         media_radio_stop();
         for (int i = 0; i < 40 && radio_task_handle; i++) {
@@ -1242,6 +1245,16 @@ esp_err_t media_radio_stop(void)
     radio_state = RADIO_STATE_STOPPED;
     radio_clear_track_title();
     return ESP_OK;
+}
+
+bool media_radio_wait_stopped(uint32_t timeout_ms)
+{
+    uint32_t waited_ms = 0;
+    while (radio_task_handle && waited_ms < timeout_ms) {
+        vTaskDelay(pdMS_TO_TICKS(25));
+        waited_ms += 25;
+    }
+    return radio_task_handle == NULL;
 }
 
 // Internal hook so callers from the HTTP API (explicit user stop) can clear

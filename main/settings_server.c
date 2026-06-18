@@ -10,6 +10,7 @@
 #include "nvs_config.h"
 #include "aic3204.h"
 #include "media_radio.h"
+#include "sendspin_iface.h"
 #include "ws_client.h"
 #include "led_control.h"
 #include "esp_http_server.h"
@@ -348,7 +349,23 @@ static const char SETTINGS_HTML[] =
 "</div>"
 "</div>"
 
-"<label><input type='checkbox' id='sendspin' disabled> Enable Snapcast (Sendspin) client <span class='tag'>Later</span></label>"
+"<h3 style='margin-top:14px;'>Sendspin <span class='tag'>Music Assistant</span></h3>"
+"<div data-no-i18n style='display:flex;align-items:center;gap:8px;margin-top:6px;'>"
+  "<input type='checkbox' id='snap-enable' onchange='snapEnabledChanged()' style='width:auto;flex:none;margin:0;'>"
+  "<label for='snap-enable' data-no-i18n style='margin:0;cursor:pointer;'>Enable Sendspin player</label>"
+"</div>"
+"<div id='snap-fields' style='margin-top:8px;'>"
+  "<label data-no-i18n>Client name <span class='tag'>shown in Music Assistant</span></label>"
+  "<input id='snap-name' maxlength='31' placeholder='leave blank to use device name' autocomplete='off' data-bwignore='true' autocorrect='off' autocapitalize='off' spellcheck='false'>"
+  "<label data-no-i18n>Server URL <span class='tag'>optional, leave blank for mDNS</span></label>"
+  "<input id='snap-url' maxlength='127' placeholder='ws://192.168.1.174:8927/sendspin' autocomplete='off' data-bwignore='true' autocorrect='off' autocapitalize='off' spellcheck='false'>"
+  "<p class='info' data-no-i18n style='margin-top:6px;'>Normally the Music Assistant server discovers this device via mDNS. If discovery fails (some routers block multicast), enter the server URL manually.</p>"
+  "<div class='row' style='margin-top:6px;'>"
+    "<button data-no-i18n class='btn btn-primary' onclick='saveSnap()'>Save Sendspin</button>"
+    "<span id='snap-status' class='status'></span>"
+  "</div>"
+  "<p class='info' id='snap-state' style='margin-top:6px;' data-no-i18n></p>"
+"</div>"
 "</div>"
 
 // System card
@@ -387,11 +404,11 @@ static const char SETTINGS_HTML[] =
 "function setTxt(id,txt){var e=$(id);if(e)e.textContent=txt;}"
 "function applyLanguage(l){lang=dict[l]?l:'hu';document.documentElement.lang=lang;setTxt('ui-lang-label',t('ui'));"
 "var hs=document.querySelectorAll('.card h2');if(hs[0])hs[0].innerHTML='&#127926; '+t('vol')+' & EQ';if(hs[1])hs[1].innerHTML='&#128273; '+t('api');if(hs[2])hs[2].innerHTML='&#127908; '+t('voice');if(hs[3])hs[3].innerHTML='&#127911; '+t('media');if(hs[4])hs[4].innerHTML='&#9881; '+t('system');"
-"var labels=document.querySelectorAll('.card label');var vals=[t('vol'),t('eq'),t('apikey'),'API Endpoint',t('admin'),t('wake'),sensLabel[lang]||sensLabel.en,t('rtvoice'),t('style'),t('basePrompt'),t('addPrompt'),t('timeout'),t('radio'),'Snapcast',t('dev')];labels.forEach(function(e,i){if(vals[i])e.textContent=vals[i];});"
+"var labels=document.querySelectorAll('.card label:not([data-no-i18n])');var vals=[t('vol'),t('eq'),t('apikey'),'API Endpoint',t('admin'),t('wake'),sensLabel[lang]||sensLabel.en,t('rtvoice'),t('style'),t('basePrompt'),t('addPrompt'),t('timeout'),t('radio'),t('dev')];labels.forEach(function(e,i){if(vals[i])e.textContent=vals[i];});"
 "var so=sensOpts[lang]||sensOpts.en;var ss=$('ww-sensitivity');if(ss){for(var j=0;j<ss.options.length&&j<so.length;j++)ss.options[j].textContent=so[j];}"
-"setTxt('admin-key-info',t('adminInfo'));var b=document.querySelectorAll('button');if(b[0])b[0].textContent=t('saveApi');if(b[1])b[1].textContent=t('saveVoice');if(b[2])b[2].textContent=t('play');if(b[3])b[3].textContent=t('stop');if(b[4])b[4].textContent=t('edit');if(b[7])b[7].textContent=t('saveDev');if(b[8])b[8].textContent=t('reboot')||'Restart device';if(b[9])b[9].textContent=t('reset');"
+"setTxt('admin-key-info',t('adminInfo'));var b=document.querySelectorAll('button:not([data-no-i18n])');if(b[0])b[0].textContent=t('saveApi');if(b[1])b[1].textContent=t('saveVoice');if(b[2])b[2].textContent=t('play');if(b[3])b[3].textContent=t('stop');if(b[4])b[4].textContent=t('edit');if(b[7])b[7].textContent=t('saveDev');if(b[8])b[8].textContent=t('reboot')||'Restart device';if(b[9])b[9].textContent=t('reset');"
 "var st=t('styles');var opts=$('conv-style').options;for(var i=0;i<opts.length&&i<st.length;i++)opts[i].textContent=st[i];"
-"var inf=infoText[lang]||infoText.en;document.querySelectorAll('.info').forEach(function(e,i){if(inf[i])e.textContent=inf[i];});"
+"var inf=infoText[lang]||infoText.en;document.querySelectorAll('.info:not([data-no-i18n])').forEach(function(e,i){if(inf[i])e.textContent=inf[i];});"
 "$('apikey').placeholder=t('apikey');$('adminkey').placeholder=t('admin');$('system-prompt').placeholder=t('addPrompt');}"
 "function applyStatus(d){"
 "$('title').innerHTML='&#9881; '+(d.device_name||'MiciMike');"
@@ -404,6 +421,8 @@ static const char SETTINGS_HTML[] =
 "var u=d.usage||{};if(!orgUsageActive){$('tok-text').className='usage '+(u.has_usage?'ok':'');$('tok-text').title=u.raw_json||'';"
 "$('tok-text').textContent=u.has_usage?('TOK '+u.total_tokens+' / '+u.input_tokens+' in / '+u.output_tokens+' out'):'TOK --';}"
 "var lr=$('last-response-row');if(lr){var txt=(d.last_response_text||'').trim();if(txt){lr.textContent=txt;lr.style.display='block';}else{lr.textContent='';lr.style.display='none';}}"
+"if(d.volume!==undefined&&document.activeElement!==$('volume')){"
+"$('volume').value=d.volume;$('vol-val').textContent=d.volume;}"
 "}"
 
 // Load current settings
@@ -431,6 +450,10 @@ static const char SETTINGS_HTML[] =
 "$('fwinfo').textContent='Firmware v1 | ESP-IDF v6.0.1 | Free heap: '+d.free_heap+' B | internal '+ih+' B largest '+ib+' B frag '+ifrag+'% | PSRAM '+sh+' B largest '+sb+' B frag '+sfrag+'%';"
 "radioStations=d.radio_stations||[];radioCurrentIdx=(d.radio_current_index===undefined?-1:d.radio_current_index);"
 "renderStationDropdown();"
+"try{if($('snap-enable'))$('snap-enable').checked=!!d.snapcast_enable;"
+"if($('snap-name'))$('snap-name').value=d.snapcast_name||'';"
+"if($('snap-url'))$('snap-url').value=d.snapcast_host||'';"
+"snapEnabledChanged();}catch(e){console.error('snap init',e);}"
 "refreshOrgUsage();"
 "});"
 
@@ -527,6 +550,26 @@ static const char SETTINGS_HTML[] =
 "}).then(r=>r.ok?show('volume-status',w('volSaved'),1):show('volume-status',w('error'),0))"
 ".catch(e=>show('volume-status',w('error')+': '+e,0));}"
 
+"function snapEnabledChanged(){var on=$('snap-enable').checked;"
+"['snap-name','snap-url'].forEach(function(id){var n=$(id);if(n)n.disabled=!on;});}"
+
+"function saveSnap(){"
+"var body={snapcast_enable:$('snap-enable').checked?1:0,"
+"snapcast_name:$('snap-name').value.trim(),"
+"snapcast_host:$('snap-url').value.trim()};"
+"fetch('/api/snapcast',{method:'POST',headers:{'Content-Type':'application/json'},"
+"body:JSON.stringify(body)})"
+".then(r=>r.ok?show('snap-status','Saved — restart device to apply',1):show('snap-status','ERR',0))"
+".then(refreshSnap).catch(e=>show('snap-status','ERR: '+e,0));}"
+
+"function refreshSnap(){fetch('/api/snapcast').then(r=>r.json()).then(function(d){"
+"var el=$('snap-state');if(!el)return;"
+"if(!d.enabled){el.textContent='Disabled.';return;}"
+"var st=d.state||'?';"
+"el.textContent='State: '+st+(d.error?(' • '+d.error):'');"
+"}).catch(()=>{});}"
+"setInterval(refreshSnap,5000);refreshSnap();"
+
 "function saveEq(){"
 "fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},"
 "body:JSON.stringify({eq_profile:$('eq-profile').value})"
@@ -611,6 +654,11 @@ static esp_err_t api_get_handler(httpd_req_t *req)
     cJSON_AddStringToObject(root, "system_prompt", live_cfg->system_prompt);
     cJSON_AddNumberToObject(root, "volume", live_cfg->volume);
     cJSON_AddNumberToObject(root, "session_timeout_s", live_cfg->session_timeout_s);
+    cJSON_AddBoolToObject(root, "snapcast_enable", live_cfg->snapcast_enable);
+    cJSON_AddStringToObject(root, "snapcast_host", live_cfg->snapcast_host);
+    cJSON_AddNumberToObject(root, "snapcast_port",
+                            live_cfg->snapcast_port ? live_cfg->snapcast_port : DEFAULT_SNAPCAST_PORT);
+    cJSON_AddStringToObject(root, "snapcast_name", live_cfg->snapcast_name);
     cJSON_AddNumberToObject(root, "free_heap", esp_get_free_heap_size());
     cJSON_AddNumberToObject(root, "free_internal_heap", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     cJSON_AddNumberToObject(root, "largest_internal_block", heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
@@ -1225,6 +1273,95 @@ static esp_err_t api_radio_stations_post_handler(httpd_req_t *req)
 }
 
 // ---------------------------------------------------------------------------
+// /api/snapcast — GET current state + config, POST to update config
+// ---------------------------------------------------------------------------
+static const char *snap_state_name(sendspin_state_t st)
+{
+    switch (st) {
+    case SENDSPIN_STATE_STOPPED:    return "stopped";
+    case SENDSPIN_STATE_STARTING:   return "starting";
+    case SENDSPIN_STATE_LISTENING:  return "listening";
+    case SENDSPIN_STATE_CONNECTED:  return "connected";
+    case SENDSPIN_STATE_PLAYING:    return "playing";
+    case SENDSPIN_STATE_ERROR:      return "error";
+    }
+    return "unknown";
+}
+
+static esp_err_t api_snapcast_get_handler(httpd_req_t *req)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "enabled", live_cfg->snapcast_enable);
+    cJSON_AddStringToObject(root, "host", live_cfg->snapcast_host);
+    cJSON_AddNumberToObject(root, "port",
+                            live_cfg->snapcast_port ? live_cfg->snapcast_port : DEFAULT_SNAPCAST_PORT);
+    cJSON_AddStringToObject(root, "name", live_cfg->snapcast_name);
+    cJSON_AddStringToObject(root, "state", snap_state_name(sendspin_iface_get_state()));
+    cJSON_AddStringToObject(root, "error", sendspin_iface_get_error());
+
+    const char *json = cJSON_PrintUnformatted(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, json);
+    free((void *)json);
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+static esp_err_t api_snapcast_post_handler(httpd_req_t *req)
+{
+    char buf[512];
+    int received = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (received <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No data");
+        return ESP_FAIL;
+    }
+    buf[received] = '\0';
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+        return ESP_FAIL;
+    }
+
+    cJSON *en   = cJSON_GetObjectItem(root, "snapcast_enable");
+    cJSON *host = cJSON_GetObjectItem(root, "snapcast_host");
+    cJSON *port = cJSON_GetObjectItem(root, "snapcast_port");
+    cJSON *name = cJSON_GetObjectItem(root, "snapcast_name");
+
+    if (en) {
+        live_cfg->snapcast_enable = cJSON_IsTrue(en) ||
+                                    (cJSON_IsNumber(en) && en->valueint != 0) ? 1 : 0;
+    }
+    if (host && cJSON_IsString(host)) {
+        strncpy(live_cfg->snapcast_host, host->valuestring,
+                sizeof(live_cfg->snapcast_host) - 1);
+        live_cfg->snapcast_host[sizeof(live_cfg->snapcast_host) - 1] = '\0';
+    }
+    if (port && cJSON_IsNumber(port)) {
+        int p = port->valueint;
+        if (p < 1 || p > 65535) p = DEFAULT_SNAPCAST_PORT;
+        live_cfg->snapcast_port = (uint16_t)p;
+    }
+    if (live_cfg->snapcast_port == 0) {
+        live_cfg->snapcast_port = DEFAULT_SNAPCAST_PORT;
+    }
+    if (name && cJSON_IsString(name)) {
+        strncpy(live_cfg->snapcast_name, name->valuestring,
+                sizeof(live_cfg->snapcast_name) - 1);
+        live_cfg->snapcast_name[sizeof(live_cfg->snapcast_name) - 1] = '\0';
+    }
+
+    nvs_config_save(live_cfg);
+    cJSON_Delete(root);
+
+    if (settings_changed_cb) {
+        settings_changed_cb(SETTINGS_CHANGED_SNAPCAST);
+    }
+
+    return api_snapcast_get_handler(req);
+}
+
+// ---------------------------------------------------------------------------
 // GET / — serve settings page
 // ---------------------------------------------------------------------------
 static esp_err_t root_handler(httpd_req_t *req)
@@ -1242,7 +1379,10 @@ esp_err_t settings_server_start(micimike_config_t *cfg, settings_changed_cb_t ch
     settings_changed_cb = changed_cb;
 
     httpd_config_t http_cfg = HTTPD_DEFAULT_CONFIG();
-    http_cfg.max_uri_handlers = 14;   // root, settings, reset/reboot, usage, radio play/stop/status/stations
+    http_cfg.max_uri_handlers = 16;   // root, settings, reset/reboot, usage, radio play/stop/status/stations, snapcast get/post
+    // The settings page is rarely opened by more than one tab. Drop the default
+    // (7) to 4 so we leave socket headroom for the sendspin httpd + WS server.
+    http_cfg.max_open_sockets = 4;
     http_cfg.stack_size = 8192;
 
     esp_err_t ret = httpd_start(&server, &http_cfg);
@@ -1262,6 +1402,8 @@ esp_err_t settings_server_start(micimike_config_t *cfg, settings_changed_cb_t ch
     httpd_uri_t api_radio_status = { .uri = "/api/radio/status", .method = HTTP_GET, .handler = api_radio_status_handler };
     httpd_uri_t api_radio_stations_get = { .uri = "/api/radio/stations", .method = HTTP_GET,  .handler = api_radio_stations_get_handler };
     httpd_uri_t api_radio_stations_post = { .uri = "/api/radio/stations", .method = HTTP_POST, .handler = api_radio_stations_post_handler };
+    httpd_uri_t api_snapcast_get  = { .uri = "/api/snapcast", .method = HTTP_GET,  .handler = api_snapcast_get_handler };
+    httpd_uri_t api_snapcast_post = { .uri = "/api/snapcast", .method = HTTP_POST, .handler = api_snapcast_post_handler };
 
     httpd_register_uri_handler(server, &root);
     httpd_register_uri_handler(server, &api_get);
@@ -1274,6 +1416,8 @@ esp_err_t settings_server_start(micimike_config_t *cfg, settings_changed_cb_t ch
     httpd_register_uri_handler(server, &api_radio_status);
     httpd_register_uri_handler(server, &api_radio_stations_get);
     httpd_register_uri_handler(server, &api_radio_stations_post);
+    httpd_register_uri_handler(server, &api_snapcast_get);
+    httpd_register_uri_handler(server, &api_snapcast_post);
 
     // Log the URL
     esp_netif_ip_info_t ip_info;

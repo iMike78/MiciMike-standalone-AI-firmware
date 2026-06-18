@@ -1,0 +1,2 @@
+dependencies:
+  sendspin/sendspin-cpp: "^0.6.1"

@@ -26,6 +26,8 @@
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 
+#include "mdns.h"
+
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -42,6 +44,7 @@ static const char *TAG = "snapclient";
 #define SNAP_RECONNECT_BACKOFF_MS 2000
 #define SNAP_RECV_TIMEOUT_S     5
 #define SNAP_BASE_HEADER_BYTES  26
+#define SNAP_MDNS_QUERY_MS      3000
 
 typedef struct {
     snapclient_config_t cfg;
@@ -55,7 +58,7 @@ typedef struct {
     void *state_cb_user;
 } snap_ctx_t;
 
-static snap_ctx_t s_ctx;
+static snap_ctx_t s_ctx = { .sock = -1 };
 static SemaphoreHandle_t s_ctx_mutex = NULL;
 
 // -------------------------------------------------------------------------
@@ -222,12 +225,58 @@ static int recv_one_message(uint8_t *scratch, size_t scratch_cap)
 // -------------------------------------------------------------------------
 // TCP connect using a numeric IP or hostname (resolved synchronously).
 // -------------------------------------------------------------------------
+// mDNS browse for _snapcast._tcp. — fill host_out + port_out with the first
+// IPv4 responder we find. Returns 0 on success, -1 on failure (with set_error).
+static int discover_snapserver(char *host_out, size_t host_cap, uint16_t *port_out)
+{
+    set_state(SNAP_STATE_DISCOVERING);
+    ESP_LOGI(TAG, "mDNS: querying _snapcast._tcp.");
+
+    mdns_result_t *results = NULL;
+    esp_err_t err = mdns_query_ptr("_snapcast", "_tcp", SNAP_MDNS_QUERY_MS, 4, &results);
+    if (err != ESP_OK) {
+        set_error("mDNS query failed: %s", esp_err_to_name(err));
+        return -1;
+    }
+    if (!results) {
+        set_error("No _snapcast._tcp. responders on the network");
+        return -1;
+    }
+
+    int rc = -1;
+    for (mdns_result_t *r = results; r != NULL; r = r->next) {
+        for (mdns_ip_addr_t *a = r->addr; a != NULL; a = a->next) {
+            if (a->addr.type != ESP_IPADDR_TYPE_V4) continue;
+            esp_ip4_addr_t v4 = a->addr.u_addr.ip4;
+            snprintf(host_out, host_cap, IPSTR, IP2STR(&v4));
+            *port_out = r->port ? r->port : 1704;
+            ESP_LOGI(TAG, "mDNS: snapserver at %s:%u (hostname=%s)",
+                     host_out, (unsigned)*port_out,
+                     r->hostname ? r->hostname : "?");
+            rc = 0;
+            break;
+        }
+        if (rc == 0) break;
+    }
+    mdns_query_results_free(results);
+    if (rc != 0) {
+        set_error("mDNS responders had no usable IPv4 address");
+    }
+    return rc;
+}
+
 static int tcp_connect(void)
 {
+    char host[64];
+    uint16_t port = s_ctx.cfg.port ? s_ctx.cfg.port : 1704;
+
     if (s_ctx.cfg.host[0] == '\0') {
-        // mDNS discovery is iter-2 work.
-        set_error("mDNS discovery not implemented yet; set a host explicitly");
-        return -1;
+        if (discover_snapserver(host, sizeof(host), &port) < 0) {
+            return -1;
+        }
+    } else {
+        strncpy(host, s_ctx.cfg.host, sizeof(host) - 1);
+        host[sizeof(host) - 1] = '\0';
     }
 
     struct addrinfo hints = {
@@ -236,11 +285,11 @@ static int tcp_connect(void)
     };
     struct addrinfo *res = NULL;
     char port_str[8];
-    snprintf(port_str, sizeof(port_str), "%u", (unsigned)s_ctx.cfg.port);
+    snprintf(port_str, sizeof(port_str), "%u", (unsigned)port);
 
-    int gai = getaddrinfo(s_ctx.cfg.host, port_str, &hints, &res);
+    int gai = getaddrinfo(host, port_str, &hints, &res);
     if (gai != 0 || !res) {
-        set_error("DNS lookup failed for %s: %d", s_ctx.cfg.host, gai);
+        set_error("DNS lookup failed for %s: %d", host, gai);
         return -1;
     }
 
@@ -260,13 +309,13 @@ static int tcp_connect(void)
 
     if (connect(s_ctx.sock, res->ai_addr, res->ai_addrlen) < 0) {
         set_error("connect to %s:%u failed: %s",
-                  s_ctx.cfg.host, (unsigned)s_ctx.cfg.port, strerror(errno));
+                  host, (unsigned)port, strerror(errno));
         freeaddrinfo(res);
         close_socket();
         return -1;
     }
 
-    ESP_LOGI(TAG, "TCP connected to %s:%u", s_ctx.cfg.host, (unsigned)s_ctx.cfg.port);
+    ESP_LOGI(TAG, "TCP connected to %s:%u", host, (unsigned)port);
     freeaddrinfo(res);
     return 0;
 }
@@ -372,8 +421,12 @@ esp_err_t snapclient_stop(void)
     ensure_mutex();
     xSemaphoreTake(s_ctx_mutex, portMAX_DELAY);
 
-    s_ctx.stop_requested = true;
-    close_socket();   // unblock recv()
+    if (s_ctx.task) {
+        s_ctx.stop_requested = true;
+        close_socket();   // unblock recv()
+    }
+    // If no task was ever started, leave fd 0 alone — the struct's
+    // default-zero `sock` would otherwise match a legitimate descriptor.
 
     xSemaphoreGive(s_ctx_mutex);
     return ESP_OK;

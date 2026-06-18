@@ -37,8 +37,11 @@
 #include "alexa_model.h"
 #include "stop_model.h"
 #include "media_radio.h"
+#include "sendspin_iface.h"
 
 #include "esp_log.h"
+#include "esp_mac.h"
+#include "mdns.h"
 #include "esp_timer.h"
 #include "esp_system.h"
 #include "driver/gpio.h"
@@ -79,6 +82,8 @@ static volatile bool speaker_amp_on = false;
 static volatile bool end_session_after_response = false;
 static volatile bool session_end_cleanup_pending = false;
 static volatile int64_t mww_restart_not_before_ms = 0;
+static volatile bool sendspin_radio_takeover_pending = false;
+static TaskHandle_t sendspin_radio_takeover_task_handle = NULL;
 static char active_wakeword[32] = DEFAULT_WAKEWORD;
 
 // Audio playback queue (response audio from API → speaker).
@@ -123,6 +128,13 @@ static void session_end_cleanup_task(void *arg);
 static void session_error_cleanup_task(void *arg);
 static void on_settings_changed(uint32_t changed_mask);
 static void on_stop_word_detected(const char *wake_word);
+static void sendspin_apply_config(void);
+static size_t sendspin_pcm_cb(const uint8_t *data, size_t length,
+                              uint32_t timeout_ms, void *user);
+static void sendspin_volume_cb(uint8_t volume, void *user);
+static void sendspin_mute_cb(bool muted, void *user);
+static void sendspin_radio_takeover_task(void *arg);
+static void sendspin_request_radio_takeover(void);
 
 static const uint8_t *wakeword_model_data(const char *wakeword, size_t *size)
 {
@@ -193,6 +205,192 @@ static void on_settings_changed(uint32_t changed_mask)
                         SETTINGS_CHANGED_PROMPT | SETTINGS_CHANGED_API)) {
         ESP_LOGI(TAG, "API/voice prompt settings saved; they apply on the next API session");
     }
+
+    if (changed_mask & SETTINGS_CHANGED_SNAPCAST) {
+        // The sendspin-cpp library destructor doesn't survive a live
+        // start/stop cycle (tlsf_free assert in 0.6.1), so we defer
+        // applying the change until the next boot.
+        ESP_LOGI(TAG, "Sendspin settings saved; reboot required to apply");
+    }
+}
+
+// Apply the current NVS-backed sendspin settings: stop a running player,
+// then start a new one if enabled. The sendspin-cpp library brings its own
+// WS server + mDNS advertisement; we only feed it identity + the PCM sink.
+static void sendspin_apply_config(void)
+{
+    sendspin_iface_stop();
+
+    if (!config.snapcast_enable) {
+        ESP_LOGI(TAG, "Sendspin disabled — player not started");
+        return;
+    }
+
+    sendspin_iface_config_t ss = {0};
+    const char *cname = config.snapcast_name[0] ? config.snapcast_name : config.device_name;
+    strncpy(ss.name, cname, sizeof(ss.name) - 1);
+
+    // Prefix the MAC-derived id so Music Assistant treats this as a fresh
+    // Sendspin player if an older cached MAC-only entry missed device_info.
+    uint8_t mac[6] = {0};
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    snprintf(ss.client_id, sizeof(ss.client_id),
+             "mrd-%02x%02x%02x%02x%02x%02x",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+    // Reuse the (formerly Snapcast) host NVS slot as an optional Sendspin
+    // server URL fallback for environments where mDNS doesn't propagate.
+    strncpy(ss.server_url, config.snapcast_host, sizeof(ss.server_url) - 1);
+    ss.initial_volume = config.volume;
+
+    ESP_LOGI(TAG, "Starting Sendspin player: name='%s' id=%s url='%s'",
+             ss.name, ss.client_id, ss.server_url[0] ? ss.server_url : "(mDNS only)");
+    sendspin_iface_set_pcm_cb(sendspin_pcm_cb, NULL);
+    sendspin_iface_set_volume_cb(sendspin_volume_cb, NULL);
+    sendspin_iface_set_mute_cb(sendspin_mute_cb, NULL);
+    esp_err_t ret = sendspin_iface_start(&ss);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "sendspin_iface_start failed: %s", esp_err_to_name(ret));
+    }
+}
+
+static void sendspin_volume_cb(uint8_t volume, void *user)
+{
+    (void)user;
+    if (volume > 100) volume = 100;
+
+    config.volume = volume;
+    esp_err_t ret = aic3204_set_volume(config.volume);
+    if (ret == ESP_OK) {
+        led_control_show_volume(config.volume);
+        ESP_LOGI(TAG, "Sendspin server volume applied: %u%%",
+                 (unsigned)config.volume);
+    } else {
+        ESP_LOGW(TAG, "Sendspin server volume failed: %s", esp_err_to_name(ret));
+    }
+}
+
+static void sendspin_mute_cb(bool muted, void *user)
+{
+    (void)user;
+    uint8_t effective_volume = muted ? 0 : config.volume;
+    esp_err_t ret = aic3204_set_volume(effective_volume);
+    if (ret == ESP_OK) {
+        if (muted) {
+            led_control_show_volume(0);
+        } else {
+            led_control_show_volume(config.volume);
+        }
+        ESP_LOGI(TAG, "Sendspin server mute applied: %s", muted ? "true" : "false");
+    } else {
+        ESP_LOGW(TAG, "Sendspin server mute failed: %s", esp_err_to_name(ret));
+    }
+}
+
+static void sendspin_radio_takeover_task(void *arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "Sendspin takeover: stopping web radio");
+    media_radio_stop();
+    if (!media_radio_wait_stopped(1000)) {
+        ESP_LOGW(TAG, "Radio task still running after Sendspin takeover grace period");
+    }
+    sendspin_radio_takeover_pending = false;
+    sendspin_radio_takeover_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static void sendspin_request_radio_takeover(void)
+{
+    if (sendspin_radio_takeover_pending) return;
+
+    sendspin_radio_takeover_pending = true;
+    BaseType_t ok = xTaskCreatePinnedToCore(sendspin_radio_takeover_task,
+                                            "ss_takeover", 4096, NULL, 7,
+                                            &sendspin_radio_takeover_task_handle, 0);
+    if (ok != pdPASS) {
+        ESP_LOGW(TAG, "Sendspin takeover task launch failed; stopping radio inline");
+        media_radio_stop();
+        media_radio_wait_stopped(250);
+        sendspin_radio_takeover_pending = false;
+        sendspin_radio_takeover_task_handle = NULL;
+    }
+}
+
+// PCM sink for the sendspin player. The library hands us 16-bit signed
+// interleaved stereo PCM at 48 kHz (matching what we declare in
+// PlayerRoleConfig::audio_formats). The AIC3204 path is 32-bit interleaved
+// stereo at the same rate, so we left-shift each sample by 16 bits and
+// pass it through mm_i2s_write.
+//
+// Voice-barge-in mediation: while a voice session is live, the Sendspin
+// stream stays silent and we consume its bytes so the WS does not backpressure.
+// For media playback, Sendspin and internet radio are last-command-wins:
+// if Sendspin audio arrives over radio, it stops the radio and takes over.
+static size_t sendspin_pcm_cb(const uint8_t *data, size_t length,
+                              uint32_t timeout_ms, void *user)
+{
+    (void)user;
+    if (length == 0) return 0;
+
+    if (app_state == APP_STATE_SESSION) {
+        size_t frames = length / (sizeof(int16_t) * 2);
+        uint32_t duration_ms = (uint32_t)((frames * 1000U) / 48000U);
+        if (duration_ms > 0) {
+            vTaskDelay(pdMS_TO_TICKS(duration_ms));
+        }
+        return length;
+    }
+
+    radio_state_t radio_state = media_radio_get_state();
+    if (radio_state == RADIO_STATE_PLAYING || radio_state == RADIO_STATE_CONNECTING) {
+        sendspin_request_radio_takeover();
+        return length;
+    }
+    if (sendspin_radio_takeover_pending) {
+        return length;
+    }
+
+    static int32_t *scratch = NULL;
+    static size_t   scratch_cap = 0;
+
+    size_t in_samples = length / sizeof(int16_t);
+    size_t out_bytes  = in_samples * sizeof(int32_t);
+    if (out_bytes > scratch_cap) {
+        size_t new_cap = out_bytes * 2;
+        int32_t *p = heap_caps_realloc(scratch, new_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!p) {
+            ESP_LOGW(TAG, "Sendspin PCM scratch realloc(%u) failed", (unsigned)new_cap);
+            return 0;
+        }
+        scratch = p;
+        scratch_cap = new_cap;
+    }
+
+    const int16_t *in = (const int16_t *)data;
+    for (size_t i = 0; i < in_samples; i++) {
+        scratch[i] = ((int32_t)in[i]) << 16;
+    }
+
+    if (!speaker_amp_on || gpio_get_level(PIN_SPEAKER_AMP) == 0) {
+        speaker_amp_enable(true);
+    }
+
+    // The library passes AUDIO_WRITE_TIMEOUT_MS = 20 ms, but the AIC3204 I2S
+    // path is XMOS-clocked at 48 kHz/32-bit/stereo = 192 kB/s — 20 ms only
+    // fits ~3.8 kB while the sync task hands us up to ~32 kB chunks. Bump
+    // the I2S timeout so the write completes in one go and the encoded
+    // ring buffer can drain instead of overflowing.
+    uint32_t i2s_timeout = timeout_ms < 1000 ? 1000 : timeout_ms;
+
+    size_t written = 0;
+    esp_err_t ret = mm_i2s_write(scratch, out_bytes, &written, i2s_timeout);
+
+    if (ret != ESP_OK || written == 0) {
+        return 0;
+    }
+    // Report bytes consumed from the input buffer (16-bit samples).
+    return (written / sizeof(int32_t)) * sizeof(int16_t);
 }
 
 static void start_session(const char *reason)
@@ -1040,6 +1238,31 @@ void app_main(void)
                      "Check that UDP/123 is reachable from this network.");
     }
 
+    // Step 5c: Initialise mDNS so Snapcast discovery + name advertising work.
+    if (mdns_init() == ESP_OK) {
+        char host[33];
+        size_t pos = 0;
+        for (size_t i = 0; config.device_name[i] && pos + 1 < sizeof(host); i++) {
+            char c = config.device_name[i];
+            if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+            if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+                host[pos++] = c;
+            } else if (pos > 0 && host[pos - 1] != '-') {
+                host[pos++] = '-';
+            }
+        }
+        while (pos > 0 && host[pos - 1] == '-') pos--;
+        if (pos == 0) {
+            strncpy(host, "micimike", sizeof(host) - 1);
+            pos = strlen(host);
+        }
+        host[pos] = '\0';
+        mdns_hostname_set(host);
+        mdns_instance_name_set(config.device_name);
+    } else {
+        ESP_LOGW(TAG, "mDNS init failed — Snapcast auto-discovery will not work");
+    }
+
     // Step 6: Start settings web server (accessible on local network)
     settings_server_start(&config, on_settings_changed);
 
@@ -1144,6 +1367,11 @@ void app_main(void)
     } else {
         ESP_LOGW(TAG, "Wake word init failed â€” manual wake only (center button still works)");
     }
+
+    // Step 12b: Start the Sendspin player if the user enabled it. The
+    // library spawns its own WS server and mDNS advertisement; PCM
+    // routing to I2S is wired up via sendspin_iface_set_pcm_cb later.
+    sendspin_apply_config();
 
     // Step 13: Ready!
     app_state = APP_STATE_IDLE;

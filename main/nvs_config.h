@@ -35,6 +35,14 @@ typedef struct {
     char wakeword_sensitivity[16];
     uint8_t volume;
     uint16_t session_timeout_s;
+
+    // Snapcast / Sendspin client. host="" means use mDNS discovery
+    // (_snapcast._tcp.). client_name is what shows up in the Snapcast
+    // group UI / Music Assistant; defaults to device_name if empty.
+    uint8_t  snapcast_enable;
+    char     snapcast_host[64];
+    uint16_t snapcast_port;
+    char     snapcast_name[32];
 } micimike_config_t;
 
 esp_err_t nvs_config_init(void);

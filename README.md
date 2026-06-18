@@ -1,6 +1,6 @@
 # MiciMike AI Firmware
 
-Alternative ESP-IDF firmware for the MiciMike Home/Nest Mini drop-in PCBs
+Alternative ESP-IDF firmware v0.6 for the MiciMike Home/Nest Mini drop-in PCBs
 (ESP32-S3 + XMOS XU316). It turns the board into a standalone, privacy-conscious
 AI voice device using the OpenAI Realtime API, an OpenAI-compatible service, or
 a self-hosted Realtime LLM endpoint.
@@ -71,6 +71,8 @@ Power amplifier / speaker path
 - UI localization for English, German, Spanish, Portuguese, Italian, Polish, and
   Hungarian.
 - Internet radio playback for direct HTTP streams.
+- Experimental Sendspin / Music Assistant player support with explicit server
+  URL fallback for networks where mDNS discovery is unreliable.
 - Hardware mute switch with LED feedback.
 - LED state animations for idle, listening, speaking, volume, zero-volume, and
   mute states.
@@ -103,8 +105,35 @@ and Realtime API behavior.
 | Web lookup tool | Implemented |
 | LED feedback | Implemented |
 | Touch/button path | Implemented, needs final-board validation |
-| Snapcast/Sendspin | Skeleton only |
+| Snapcast/Sendspin | Experimental Music Assistant player integration |
 | OTA updates | Not implemented |
+
+## v0.6 Sendspin Notes
+
+This release adds the first usable Sendspin integration for Music Assistant.
+The web UI can enable the player, set the Music Assistant server URL explicitly
+when mDNS discovery is unreliable, and choose the client name shown in Music
+Assistant. The device advertises itself as `MRD / Home Mini DiP`.
+
+Playback is currently intentionally limited to 48 kHz 16-bit stereo PCM. FLAC is
+not advertised in this release because the ESP32-S3 path decodes it in software
+in this stack and testing showed worse buffering and timing behavior than raw
+PCM.
+
+Current behavior and known limitations:
+
+- Internet radio and Sendspin/Music Assistant playback are mutually exclusive;
+  the most recent playback command takes ownership.
+- Voice assistant playback is kept above media playback, but the audio pipeline
+  still needs a proper firmware-side mixer so assistant speech can duck, rather
+  than stop, background media.
+- Music Assistant playback can still stutter on some streams. The next audio
+  work is to move all speaker producers through one mixer-backed I2S writer and
+  keep the XMOS AEC reference timing stable.
+- Server-side Sendspin volume commands are applied locally. Web UI volume
+  changes are not yet pushed back to Music Assistant.
+- Time sync is still only waited for during boot; SNTP keeps running, but the
+  firmware does not yet gate Sendspin startup on a confirmed valid wall clock.
 
 ## Build
 

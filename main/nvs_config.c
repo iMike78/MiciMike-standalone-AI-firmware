@@ -283,6 +283,28 @@ esp_err_t nvs_config_load(micimike_config_t *cfg)
         cfg->session_timeout_s = DEFAULT_SESSION_IDLE_TIMEOUT_S;
     }
 
+    if (nvs_get_u8(h, NVS_KEY_SNAP_ENABLE, &cfg->snapcast_enable) != ESP_OK) {
+        cfg->snapcast_enable = 0;
+    }
+    cfg->snapcast_enable = cfg->snapcast_enable ? 1 : 0;
+
+    len = sizeof(cfg->snapcast_host);
+    if (nvs_get_str(h, NVS_KEY_SNAP_HOST, cfg->snapcast_host, &len) != ESP_OK) {
+        cfg->snapcast_host[0] = '\0';
+    }
+    cfg->snapcast_host[sizeof(cfg->snapcast_host) - 1] = '\0';
+
+    if (nvs_get_u16(h, NVS_KEY_SNAP_PORT, &cfg->snapcast_port) != ESP_OK ||
+        cfg->snapcast_port == 0) {
+        cfg->snapcast_port = DEFAULT_SNAPCAST_PORT;
+    }
+
+    len = sizeof(cfg->snapcast_name);
+    if (nvs_get_str(h, NVS_KEY_SNAP_NAME, cfg->snapcast_name, &len) != ESP_OK) {
+        cfg->snapcast_name[0] = '\0';
+    }
+    cfg->snapcast_name[sizeof(cfg->snapcast_name) - 1] = '\0';
+
     nvs_close(h);
     ESP_LOGI(TAG, "Config loaded: name=%s SSID=%s wakeword=%s sens=%s vol=%d eq=%s voice=%s style=%s ui_lang=%s prompt_len=%u session_timeout=%us api_key_len=%u api_url=%s",
              cfg->device_name, cfg->wifi_ssid, cfg->wakeword, cfg->wakeword_sensitivity, cfg->volume, cfg->eq_profile,
@@ -322,6 +344,12 @@ esp_err_t nvs_config_save(const micimike_config_t *cfg)
     nvs_set_str(h, NVS_KEY_WW_SENSITIVITY, cfg->wakeword_sensitivity);
     nvs_set_u8(h, NVS_KEY_VOLUME, cfg->volume);
     nvs_set_u16(h, NVS_KEY_SESSION_TIMEOUT, cfg->session_timeout_s);
+
+    nvs_set_u8(h, NVS_KEY_SNAP_ENABLE, cfg->snapcast_enable ? 1 : 0);
+    nvs_set_str(h, NVS_KEY_SNAP_HOST, cfg->snapcast_host);
+    nvs_set_u16(h, NVS_KEY_SNAP_PORT,
+                cfg->snapcast_port ? cfg->snapcast_port : DEFAULT_SNAPCAST_PORT);
+    nvs_set_str(h, NVS_KEY_SNAP_NAME, cfg->snapcast_name);
 
     esp_err_t ret = nvs_commit(h);
     nvs_close(h);

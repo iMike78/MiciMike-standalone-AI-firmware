@@ -49,4 +49,6 @@ idf_component_register(
         esp_event
         espressif__cjson
         espressif__esp-tflite-micro
+        sendspin
+        mdns
 )

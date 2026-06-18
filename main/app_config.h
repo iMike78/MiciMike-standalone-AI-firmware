@@ -119,6 +119,10 @@
 #define NVS_KEY_CONV_STYLE      "conv_style"
 #define NVS_KEY_UI_LANGUAGE     "ui_lang"
 #define NVS_KEY_SYSTEM_PROMPT   "sys_prompt"
+#define NVS_KEY_SNAP_ENABLE     "snap_en"
+#define NVS_KEY_SNAP_HOST       "snap_host"
+#define NVS_KEY_SNAP_PORT       "snap_port"
+#define NVS_KEY_SNAP_NAME       "snap_name"
 
 // ---------------------------------------------------------------------------
 // Defaults
@@ -133,4 +137,5 @@
 #define DEFAULT_UI_LANGUAGE     "hu"
 #define DEFAULT_SYSTEM_PROMPT   ""
 #define DEFAULT_API_URL         "wss://api.openai.com/v1/realtime?model=gpt-realtime-2"
+#define DEFAULT_SNAPCAST_PORT   1704
 #define CAPTIVE_PORTAL_SSID     "MiciMike-Setup"

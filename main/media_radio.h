@@ -24,6 +24,7 @@ typedef enum {
 
 esp_err_t media_radio_start(const char *url);
 esp_err_t media_radio_stop(void);
+bool media_radio_wait_stopped(uint32_t timeout_ms);
 radio_state_t media_radio_get_state(void);
 const char *media_radio_get_error(void);
 

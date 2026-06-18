@@ -41,6 +41,12 @@ CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY=y
 # Logging
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 
+# LWIP socket pool — must cover: WiFi, mDNS, SNTP, settings httpd (80) +
+# its ~4 client slots, sendspin httpd (8928) + its 2 client slots,
+# sendspin WS client (8927), OpenAI WS client, and a radio HTTP socket.
+# Default 10 is far too tight; 40 leaves headroom for bursts.
+CONFIG_LWIP_MAX_SOCKETS=40
+
 # I2C
 CONFIG_I2C_ISR_IRAM_SAFE=y
 

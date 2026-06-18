@@ -9,6 +9,7 @@ idf_component_register(
         esp_netif
         esp_event
         esp_timer
+        mdns
         # FLAC + PCM decoding will land via this managed component in iter 3:
         espressif__esp_audio_codec
 )
